@@ -1,3 +1,12 @@
 -- SQLAlchemy metadata initializes tables idempotently.
 -- Domain tables: reading_collections, reading_sessions, transition_runs, editorial_plans.
 -- Unique natural keys: source.key; (record.source_id, record.reference).
+
+-- 百万行日志断点导入（表由 SQLAlchemy metadata 自动创建，此处为口径说明）：
+-- import_jobs          导入作业与阶段状态：receiving/received/validating/validated/publishing/published/failed
+-- import_chunks        分片台账：(job_id, chunk_index) 与 (job_id, offset) 双唯一键；
+--                      重复块幂等返回，同偏移异值拒收并使作业 failed
+-- import_bad_rows      坏行隔离区：line_no + 原始行 raw_line + 拒收原因 reason
+-- import_staged_records 校验合格暂存样本：(job_id, line_no) 唯一，发布事务提交前对研究不可见
+-- 阶段恢复：validating/publishing 中断由 worker 启动清扫退回 received/validated 重新入队；
+--          重新校验先清空旧暂存与隔离数据，重试不新增样本。

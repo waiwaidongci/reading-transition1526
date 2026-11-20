@@ -4,11 +4,12 @@ from fastapi import FastAPI
 from sqlalchemy import text
 from .config.database import Base,engine
 from .config.settings import CONFIG
-from .models import user,source,record,run,note,audit
+from .models import user,source,record,run,note,audit,import_job,import_chunk,import_bad_row,import_staged
 from .middlewares.errors import error_boundary
 from .middlewares.rate_limit import rate_limit
-from .routes import auth,sources,runs,notes,audit as audit_routes
+from .routes import auth,sources,runs,notes,audit as audit_routes,imports as import_routes
 from .services.runs import queue
+from .services.import_queue import queue as import_queue
 @asynccontextmanager
 async def lifespan(app):
     Base.metadata.create_all(engine)
@@ -21,10 +22,10 @@ async def lifespan(app):
 app=FastAPI(title=CONFIG['title'],lifespan=lifespan)
 app.middleware('http')(error_boundary)
 app.middleware('http')(rate_limit)
-for router in (auth.router,sources.router,runs.router,notes.router,audit_routes.router):app.include_router(router)
+for router in (auth.router,sources.router,runs.router,notes.router,audit_routes.router,import_routes.router):app.include_router(router)
 @app.get('/health')
 def health():
     with engine.connect() as c:c.execute(text('SELECT 1'))
-    queue.ping();return {'status':'ok'}
+    queue.ping();import_queue.ping();return {'status':'ok'}
 @app.get('/catalog')
 def catalog():return CONFIG

@@ -8,12 +8,25 @@
 
 ## 业务模块
 
-1. 业务总览：批次、样本、任务与批准交付账册。
+1. 业务总览：批次、样本、任务、批准交付账册与日志导入账册。
 2. 阅读文集：创建/修改来源说明、查看样本、用真实业务字段追加记录；列表分页。
-3. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
-4. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
-5. 编辑衔接建议：分析师草案→负责人批准→阅读者下载批准快照。
-6. 审计：登录、来源修改、任务worker完成、业务说明批准等事件。
+3. 日志导入：百万行日志断点分批导入，按文件偏移续传，整批校验后一次发布。
+4. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
+5. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
+6. 编辑衔接建议：分析师草案→负责人批准→阅读者下载批准快照。
+7. 审计：登录、来源修改、导入分片/校验/发布、任务worker完成、业务说明批准等事件。
+
+## 百万行日志断点导入
+
+阅读日志只能分批追加，研究会收到尚未补齐的文件，导入链路按“接收→校验→发布”三段独立状态机设计（`import_jobs` 状态：`receiving / received / validating / validated / publishing / published / failed`）。
+
+- **接收（内存≤128MB）**：前端按 4MB 分片、以文件偏移上传；后端用 1MB 循环缓冲 `pwrite` 按偏移落盘到共享卷 `imports/job-{id}/data.log`，内存占用与文件总大小无关。`import_chunks` 以 `(job_id, chunk_index)` 与 `(job_id, offset)` 双唯一键记账：重复块直接返回 `duplicate` 不重复写入；同偏移异值或同序号异值一律 409 拒收并把作业置为 `failed`。接收完成校验分片连续性与整文件 SHA256。
+- **解析（内存≤128MB）**：`import_parser.py` 是字节级 RFC4180 流式解析器，每次只读 1MB 磁盘块。UTF-8 多字节（含中文）首字节不与引号/换行冲突，因此中文被任意切块、引号内换行跨块都能还原为同一条原记录；CRLF、孤立 CR、转义引号 `""` 均覆盖。实测 100 万行（31MB）解析约 6 秒、峰值 RSS 约 106MB。
+- **坏行隔离**：字段数不符、引号未闭合、UTF-8 坏字节、业务校验失败均写入 `import_bad_rows`，保留 `line_no`、原始行 `raw_line` 与原因 `reason`，不阻断整批；空行跳过、表头自动识别。
+- **整批失败口径**：同会话异路径（跨块同会话也算）或库内同会话异路径冲突使整批失败，冲突行连同原因进隔离区，不写入任何样本。完全重复行去重计数、不重复写入。
+- **发布原子性**：合格样本先进 `import_staged_records` 暂存，对研究完全不可见；发布在单事务内按键集分页批量写入 `reading_sessions`，研究只见整批或完全不见。发布前再次核对库内冲突（导入期间允许手工追加样本与新建研究）。
+- **可恢复**：worker 启动时清扫 `validating/publishing` 中断作业并重新入队；重新校验先清空旧暂存/隔离数据，重试不新增样本；发布崩溃回滚后重跑先清理同作业前缀残留。接收落盘与样本入库任一步中断都可从偏移/阶段继续。
+- **页面**：“日志导入”页可查看接收进度、校验/发布阶段、合格/坏行/重复/冲突计数、整文件 SHA256、失败原因与隔离区原行。
 
 ## 快速启动
 
@@ -90,7 +103,10 @@ frontend/src/api, stores, types, components/common, hooks, pages, router, utils,
 backend/src/routes, controllers, services, models, schemas, middlewares, utils, constants, config
 backend/scripts/seed_demo.py
 backend/migrations/001_initial.sql
+backend/tests/test_parser.py, test_import_flow.py, test_perf_million.py
 ```
+
+导入相关代码：`models/import_*.py`（作业/分片/隔离行/暂存样本四表）、`services/import_parser.py`（字节级流式解析）、`services/imports.py`（接收与偏移续传）、`services/import_processing.py`（worker 校验/发布/中断清扫）、`routes/imports.py`、`pages/imports.js`。
 
 本地后端：Python3.11虚拟环境安装 `backend/requirements.txt`，设置 `DATABASE_URL`、`REDIS_URL`、`ARTIFACT_DIR`，在backend目录运行 `uvicorn src.main:app --reload`；另开终端运行 `python -m src.worker`。原生前端无需编译，推荐以Compose Nginx访问，保证 `/api/` 代理。前端为Google Fonts双字体、oklch色板，离线字体回退serif；1280/768/390响应布局。
 
@@ -102,6 +118,9 @@ backend/migrations/001_initial.sql
 | JWT_SECRET | `.env.example`演示值，部署前修改 |
 | DATABASE_URL / REDIS_URL | Compose内部连接，定义在compose的env锚点 |
 | ARTIFACT_DIR | `/artifacts`，后端worker共享 |
+| IMPORT_DIR | `${ARTIFACT_DIR}/imports`，断点导入落盘目录（job-{id}/data.log） |
+| RECEIVE_CHUNK_BYTES / PARSE_BLOCK_BYTES | 均为 `1048576`（1MB），接收写盘与解析读块的流式缓冲上限 |
+| IMPORT_DB_BATCH | `2000`，暂存/发布每批落库条数；MAX_LINE_BYTES 单逻辑行上限 10MB |
 
 共享枚举：`backend/src/constants/enums.py` 与 `frontend/src/constants/enums.js` 都定义 admin/analyst/viewer、queued/running/completed/failed、draft/approved。后端service检查对应字符串；README为全量值说明。共享前端组件table/status/chart/business跨总览、结果、配置与复核复用；actions hook和format utils负责交互/格式。后端errors与rate_limit是两个中间件。
 

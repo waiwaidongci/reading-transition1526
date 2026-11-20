@@ -31,3 +31,6 @@ target/
 *.o
 *.obj
 .DS_Store
+.pytest_cache/
+*.db
+/test-artifacts/
